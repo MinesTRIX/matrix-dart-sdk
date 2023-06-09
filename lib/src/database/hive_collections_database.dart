@@ -1034,7 +1034,6 @@ class HiveCollectionsDatabase extends DatabaseApi {
   Future<void> storeEventUpdate(EventUpdate eventUpdate, Client client) async {
     // Ephemerals should not be stored
     if (eventUpdate.type == EventUpdateType.ephemeral) return;
-
     final tmpRoom = client.getRoomById(eventUpdate.roomID) ??
         Room(id: eventUpdate.roomID, client: client);
 
@@ -1196,17 +1195,13 @@ class HiveCollectionsDatabase extends DatabaseApi {
         await removeEvent(transactionId, eventUpdate.roomID);
       }
     }
-    final stateKey =
-        client.roomPreviewLastEvents.contains(eventUpdate.content['type'])
-            ? ''
-            : eventUpdate.content['state_key'];
+
     // Store a common state event
     if ({
-          EventUpdateType.timeline,
-          EventUpdateType.state,
-          EventUpdateType.inviteState
-        }.contains(eventUpdate.type) &&
-        stateKey != null) {
+      EventUpdateType.timeline,
+      EventUpdateType.state,
+      EventUpdateType.inviteState
+    }.contains(eventUpdate.type)) {
       if (eventUpdate.content['type'] == EventTypes.RoomMember) {
         await _roomMembersBox.put(
             TupleKey(
@@ -1226,36 +1221,29 @@ class HiveCollectionsDatabase extends DatabaseApi {
                 .tryGetMap<String, dynamic>('content')
                 ?.tryGetMap<String, dynamic>('m.relates_to') ==
             null) {
-          stateMap[stateKey] = eventUpdate.content;
+          stateMap[eventUpdate.content['state_key'] ?? ''] =
+              eventUpdate.content;
           await _roomStateBox.put(key, stateMap);
         } else {
           final editedEventRelationshipEventId = eventUpdate.content
               .tryGetMap<String, dynamic>('content')
               ?.tryGetMap<String, dynamic>('m.relates_to')
               ?.tryGet<String>('event_id');
-
-          final tmpRoom = client.getRoomById(eventUpdate.roomID) ??
-              Room(id: eventUpdate.roomID, client: client);
-
-          if (eventUpdate.content['type'] !=
-                      EventTypes
-                          .Message || // send anything other than a message
-                  eventUpdate.content
-                          .tryGetMap<String, dynamic>('content')
-                          ?.tryGetMap<String, dynamic>('m.relates_to')
-                          ?.tryGet<String>('rel_type') !=
-                      RelationshipTypes
-                          .edit || // replies are always latest anyway
+          final state = stateMap[''] == null
+              ? null
+              : Event.fromJson(stateMap[''] as Map<String, dynamic>, tmpRoom);
+          if (eventUpdate.content['type'] != EventTypes.Message ||
+              eventUpdate.content
+                      .tryGetMap<String, dynamic>('content')
+                      ?.tryGetMap<String, dynamic>('m.relates_to')
+                      ?.tryGet<String>('rel_type') !=
+                  RelationshipTypes.edit ||
+              editedEventRelationshipEventId == state?.eventId ||
+              ((state?.relationshipType == RelationshipTypes.edit &&
                   editedEventRelationshipEventId ==
-                      tmpRoom.lastEvent
-                          ?.eventId || // edit of latest (original event) event
-                  (tmpRoom.lastEvent?.relationshipType ==
-                          RelationshipTypes.edit &&
-                      editedEventRelationshipEventId ==
-                          tmpRoom.lastEvent
-                              ?.relationshipEventId) // edit of latest (edited event) event
-              ) {
-            stateMap[stateKey] = eventUpdate.content;
+                      state?.relationshipEventId))) {
+            stateMap[eventUpdate.content['state_key'] ?? ''] =
+                eventUpdate.content;
             await _roomStateBox.put(key, stateMap);
           }
         }
