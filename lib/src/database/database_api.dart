@@ -93,6 +93,14 @@ abstract class DatabaseApi {
     int? limit,
   });
 
+  Future<List<Event>> getEventListForType(
+    String type,
+    List<Room> rooms, {
+    int start = 0,
+    int limit,
+    String? msgType
+  });
+
   Future<Uint8List?> getFile(Uri mxcUri);
 
   Future storeFile(Uri mxcUri, Uint8List bytes, int time);

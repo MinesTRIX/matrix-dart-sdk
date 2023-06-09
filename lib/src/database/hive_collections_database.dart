@@ -81,6 +81,9 @@ class HiveCollectionsDatabase extends DatabaseApi {
   /// Key is a tuple as TupleKey(roomId, eventId)
   late CollectionBox<Map> _eventsBox;
 
+  /// Key is a string of the event type
+  late CollectionBox<List> _eventsTypesBox;
+
   /// Key is a tuple as TupleKey(userId, deviceId)
   late CollectionBox<String> _seenDeviceIdsBox;
 
@@ -120,6 +123,8 @@ class HiveCollectionsDatabase extends DatabaseApi {
 
   String get _eventsBoxName => 'box_events';
 
+  String get _eventsTypesBoxName => 'box_events_types';
+
   String get _seenDeviceIdsBoxName => 'box_seen_device_ids';
 
   String get _seenDeviceKeysBoxName => 'box_seen_device_keys';
@@ -155,6 +160,7 @@ class HiveCollectionsDatabase extends DatabaseApi {
         _presencesBoxName,
         _timelineFragmentsBoxName,
         _eventsBoxName,
+        _eventsTypesBoxName,
         _seenDeviceIdsBoxName,
         _seenDeviceKeysBoxName,
       },
@@ -217,6 +223,9 @@ class HiveCollectionsDatabase extends DatabaseApi {
     _eventsBox = await _collection.openBox(
       _eventsBoxName,
     );
+    _eventsTypesBox = await _collection.openBox(
+      _eventsTypesBoxName,
+    );
     _seenDeviceIdsBox = await _collection.openBox(
       _seenDeviceIdsBoxName,
     );
@@ -272,6 +281,7 @@ class HiveCollectionsDatabase extends DatabaseApi {
         await _roomStateBox.clear();
         await _roomMembersBox.clear();
         await _eventsBox.clear();
+        await _eventsTypesBox.clear();
         await _timelineFragmentsBox.clear();
         await _outboundGroupSessionsBox.clear();
         await _presencesBox.clear();
@@ -410,6 +420,40 @@ class HiveCollectionsDatabase extends DatabaseApi {
         ]);
 
         return await _getEventsByIds(eventIds, room);
+      });
+
+  String getIdFromTypeAndMsgType(String type, {String? msgType}) {
+    return msgType != null ? '$type/$msgType' : type;
+  }
+
+  @override
+  Future<List<Event>> getEventListForType(String type, List<Room> rooms,
+          {int start = 0, int limit = 10, String? msgType}) =>
+      runBenchmarked<List<Event>>('Get event types', () async {
+        final keys = (await _eventsTypesBox
+                    .get(getIdFromTypeAndMsgType(type, msgType: msgType)) ??
+                [])
+            .cast<String>()
+            .map((e) =>
+                TupleKey.byParts(TupleKey.fromString(e).parts.take(2).toList())
+                    .toString())
+            .toList();
+
+        final rawEvents = (await _eventsBox.getAll(keys));
+
+        final events = <Event>[];
+
+        final maxLen = min(rawEvents.length, limit + start);
+        if (maxLen - start <= 0) return [];
+        for (var i = start; i < maxLen; i++) {
+          final j = rawEvents.length - i - 1;
+          final tuple = TupleKey.fromString(keys[j]);
+          final room = rooms.firstWhereOrNull((r) => r.id == tuple.parts.first);
+          if (room != null) {
+            events.add(Event.fromJson(copyMap(rawEvents[j]!), room));
+          }
+        }
+        return events;
       });
 
   @override
@@ -1101,6 +1145,50 @@ class HiveCollectionsDatabase extends DatabaseApi {
         if (i != -1) {
           await _timelineFragmentsBox.put(key, eventIds..removeAt(i));
         }
+      }
+
+      if (status.isSynced) {
+        final type = eventUpdate.content['type'];
+        final msgType = eventUpdate.content['msgtype'];
+        final data = await _eventsTypesBox
+                .get(getIdFromTypeAndMsgType(type ?? '', msgType: msgType)) ??
+            [];
+
+        int itemPos = 0;
+        final objectId = TupleKey(eventUpdate.roomID, eventId,
+                eventUpdate.content.tryGet('origin_server_ts').toString())
+            .toString();
+
+        // remove previous item
+        final int pos = data.indexOf(objectId);
+        if (pos != -1) {
+          data.removeAt(pos);
+        }
+
+        final itemDateTime = int.parse(TupleKey.fromString(objectId).parts[2]);
+
+        // calc position of new item
+        for (itemPos = 0; itemPos < data.length; itemPos++) {
+          final item = TupleKey.fromString(data[itemPos]);
+          final dateTime = int.parse(item.parts[2]);
+
+          if (dateTime > itemDateTime) {
+            break;
+          }
+        }
+
+        data.insert(itemPos, objectId);
+
+        // there is a bug corrupting the ordering of events...
+        /* data.sort((a, b) {
+          final aInt = int.parse(TupleKey.fromString(a).parts[2]);
+          final bInt = int.parse(TupleKey.fromString(b).parts[2]);
+
+          return aInt.compareTo(bInt);
+        });
+*/
+        await _eventsTypesBox.put(
+            getIdFromTypeAndMsgType(type, msgType: msgType), data);
       }
 
       // Is there a transaction id? Then delete the event with this id.
