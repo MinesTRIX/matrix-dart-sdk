@@ -104,12 +104,14 @@ class Bootstrap {
     for (final entry in client.accountData.entries) {
       final type = entry.key;
       final event = entry.value;
-      if (event.content['encrypted'] is! Map) {
+      final encryptedContent =
+          event.content.tryGetMap<String, Object?>('encrypted');
+      if (encryptedContent == null) {
         continue;
       }
       final validKeys = <String>{};
       final invalidKeys = <String>{};
-      for (final keyEntry in event.content['encrypted'].entries) {
+      for (final keyEntry in encryptedContent.entries) {
         final key = keyEntry.key;
         final value = keyEntry.value;
         if (value is! Map) {
@@ -579,9 +581,20 @@ class Bootstrap {
       );
       Logs().v('Store the secret...');
       await newSsssKey?.store(megolmKey, base64.encode(privKey));
+      Logs().v('Wait for secret to come down sync');
+
+      if (!await encryption.keyManager.isCached()) {
+        await client.onSync.stream.firstWhere((syncUpdate) =>
+            syncUpdate.accountData != null &&
+            syncUpdate.accountData!
+                .any((accountData) => accountData.type == megolmKey));
+      }
+
       Logs().v(
           'And finally set all megolm keys as needing to be uploaded again...');
       await client.database?.markInboundGroupSessionsAsNeedingUpload();
+      Logs().v('And uploading keys...');
+      await client.encryption?.keyManager.backgroundTasks();
     } catch (e, s) {
       Logs().e('[Bootstrapping] Error setting up online key backup', e, s);
       state = BootstrapState.error;

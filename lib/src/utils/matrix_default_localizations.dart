@@ -154,14 +154,16 @@ class MatrixDefaultLocalizations extends MatrixLocalizations {
   String get noPermission => 'No permission';
 
   @override
-  String redactedAnEvent(String senderName) => '$senderName redacted an event';
+  String redactedAnEvent(Event redactedEvent) =>
+      '${redactedEvent.senderFromMemoryOrFallback.calcDisplayname()} redacted an event';
 
   @override
   String rejectedTheInvitation(String targetName) =>
       '$targetName rejected the invitation';
 
   @override
-  String removedBy(String calcDisplayname) => 'Removed by $calcDisplayname';
+  String removedBy(Event redactedEvent) =>
+      'Removed by ${redactedEvent.senderFromMemoryOrFallback.calcDisplayname()}';
 
   @override
   String get roomHasBeenUpgraded => 'Room has been upgraded';
@@ -272,4 +274,7 @@ class MatrixDefaultLocalizations extends MatrixLocalizations {
 
   @override
   String get unknownUser => 'Unknown user';
+
+  @override
+  String hasKnocked(String targetName) => '$targetName has knocked';
 }

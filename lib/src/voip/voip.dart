@@ -284,7 +284,7 @@ class VoIP {
           await delegate.stopRingtone();
         }
         if (call.state == CallState.kRinging) {
-          call.onAnsweredElsewhere();
+          await call.onAnsweredElsewhere();
         }
         return;
       }
@@ -368,7 +368,7 @@ class VoIP {
       }
       await call.onRejectReceived(content['reason']);
     } else {
-      Logs().v('[VOIP] onCallHangup: Session [$callId] not found!');
+      Logs().v('[VOIP] onCallReject: Session [$callId] not found!');
     }
   }
 
@@ -408,7 +408,7 @@ class VoIP {
             'Ignoring call select answer for room $roomId claiming to be for call in room ${call.room.id}');
         return;
       }
-      call.onSelectAnswerReceived(selectedPartyId);
+      await call.onSelectAnswerReceived(selectedPartyId);
     }
   }
 
@@ -486,8 +486,8 @@ class VoIP {
         }
         await call.onNegotiateReceived(metadata,
             RTCSessionDescription(description['sdp'], description['type']));
-      } catch (err) {
-        Logs().e('Failed to complete negotiation ${err.toString()}');
+      } catch (e, s) {
+        Logs().e('Failed to complete negotiation', e, s);
       }
     }
   }
@@ -498,8 +498,8 @@ class VoIP {
       if (session['media'].indexWhere((e) => e['type'] == 'video') != -1) {
         return CallType.kVideo;
       }
-    } catch (err) {
-      Logs().e('Failed to getCallType ${err.toString()}');
+    } catch (e, s) {
+      Logs().e('Failed to getCallType', e, s);
     }
 
     return CallType.kVoice;
@@ -704,18 +704,20 @@ class VoIP {
 
     final groupCallId = event.stateKey;
 
-    final callType = content['m.type'];
+    final callType = content.tryGet<String>('m.type');
 
-    if (callType != GroupCallType.Video && callType != GroupCallType.Voice) {
+    if (callType == null ||
+        callType != GroupCallType.Video && callType != GroupCallType.Voice) {
       Logs().w('Received invalid group call type $callType for room $roomId.');
       return null;
     }
 
-    final callIntent = content['m.intent'];
+    final callIntent = content.tryGet<String>('m.intent');
 
-    if (callIntent != GroupCallIntent.Prompt &&
-        callIntent != GroupCallIntent.Room &&
-        callIntent != GroupCallIntent.Ring) {
+    if (callIntent == null ||
+        callIntent != GroupCallIntent.Prompt &&
+            callIntent != GroupCallIntent.Room &&
+            callIntent != GroupCallIntent.Ring) {
       Logs()
           .w('Received invalid group call intent $callType for room $roomId.');
       return null;

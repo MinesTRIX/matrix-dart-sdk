@@ -298,7 +298,7 @@ class Client extends MatrixApi {
     final ruleset = TryGetPushRule.tryFromJson(
         _accountData[EventTypes.PushRules]
                 ?.content
-                .tryGetMap<String, dynamic>('global') ??
+                .tryGetMap<String, Object?>('global') ??
             {});
     _pushruleEvaluator = PushruleEvaluator.fromRuleset(ruleset);
   }
@@ -621,7 +621,29 @@ class Client extends MatrixApi {
   }) async {
     // Try to find an existing direct chat
     final directChatRoomId = getDirectChatFromUserId(mxid);
-    if (directChatRoomId != null) return directChatRoomId;
+    if (directChatRoomId != null) {
+      final room = getRoomById(directChatRoomId);
+      if (room != null) {
+        if (room.membership == Membership.join) {
+          return directChatRoomId;
+        } else if (room.membership == Membership.invite) {
+          // we might already have an invite into a DM room. If that is the case, we should try to join. If the room is
+          // unjoinable, that will automatically leave the room, so in that case we need to continue creating a new
+          // room. (This implicitly also prevents the room from being returned as a DM room by getDirectChatFromUserId,
+          // because it only returns joined or invited rooms atm.)
+          await room.join();
+          if (room.membership != Membership.leave) {
+            if (waitForSync) {
+              if (room.membership != Membership.join) {
+                // Wait for room actually appears in sync with the right membership
+                await waitForRoomInSync(directChatRoomId, join: true);
+              }
+            }
+            return directChatRoomId;
+          }
+        }
+      }
+    }
 
     enableEncryption ??=
         encryptionEnabled && await userOwnsEncryptionKeys(mxid);
@@ -646,9 +668,12 @@ class Client extends MatrixApi {
       powerLevelContentOverride: powerLevelContentOverride,
     );
 
-    if (waitForSync && getRoomById(roomId) == null) {
-      // Wait for room actually appears in sync
-      await waitForRoomInSync(roomId, join: true);
+    if (waitForSync) {
+      final room = getRoomById(roomId);
+      if (room == null || room.membership != Membership.join) {
+        // Wait for room actually appears in sync
+        await waitForRoomInSync(roomId, join: true);
+      }
     }
 
     await Room(id: roomId, client: this).addToDirectChat(mxid);
@@ -728,7 +753,7 @@ class Client extends MatrixApi {
   /// server to answer this.
   Future<bool> userOwnsEncryptionKeys(String userId) async {
     if (userId == userID) return encryptionEnabled;
-    if (_userDeviceKeys.containsKey(userId)) {
+    if (_userDeviceKeys[userId]?.deviceKeys.isNotEmpty ?? false) {
       return true;
     }
     final keys = await queryKeys({userId: []});
@@ -932,6 +957,21 @@ class Client extends MatrixApi {
                         .toList() ??
                     []));
 
+        leftRoom.prev_batch = room.timeline?.prevBatch;
+        room.state?.forEach((event) {
+          leftRoom.setState(Event.fromMatrixEvent(
+            event,
+            leftRoom,
+          ));
+        });
+
+        room.timeline?.events?.forEach((event) {
+          leftRoom.setState(Event.fromMatrixEvent(
+            event,
+            leftRoom,
+          ));
+        });
+
         for (var i = 0; i < timeline.events.length; i++) {
           // Try to decrypt encrypted events but don't update the database.
           if (leftRoom.encrypted && leftRoom.client.encryptionEnabled) {
@@ -944,21 +984,6 @@ class Client extends MatrixApi {
             }
           }
         }
-
-        room.timeline?.events?.forEach((event) {
-          leftRoom.setState(Event.fromMatrixEvent(
-            event,
-            leftRoom,
-          ));
-        });
-
-        leftRoom.prev_batch = room.timeline?.prevBatch;
-        room.state?.forEach((event) {
-          leftRoom.setState(Event.fromMatrixEvent(
-            event,
-            leftRoom,
-          ));
-        });
 
         _archivedRooms.add(ArchivedRoom(room: leftRoom, timeline: timeline));
       }
@@ -1078,7 +1103,7 @@ class Client extends MatrixApi {
   PushRuleSet? get globalPushRules {
     final pushrules = _accountData['m.push_rules']
         ?.content
-        .tryGetMap<String, dynamic>('global');
+        .tryGetMap<String, Object?>('global');
     return pushrules != null ? TryGetPushRule.tryFromJson(pushrules) : null;
   }
 
@@ -1086,7 +1111,7 @@ class Client extends MatrixApi {
   PushRuleSet? get devicePushRules {
     final pushrules = _accountData['m.push_rules']
         ?.content
-        .tryGetMap<String, dynamic>('device');
+        .tryGetMap<String, Object?>('device');
     return pushrules != null ? TryGetPushRule.tryFromJson(pushrules) : null;
   }
 
@@ -2255,12 +2280,21 @@ class Client extends MatrixApi {
   /// The compare function how the rooms should be sorted internally. By default
   /// rooms are sorted by timestamp of the last m.room.message event or the last
   /// event if there is no known message.
-  RoomSorter get sortRoomsBy => (a, b) => (a.isFavourite != b.isFavourite)
-      ? (a.isFavourite ? -1 : 1)
-      : (pinUnreadRooms && a.notificationCount != b.notificationCount)
-          ? b.notificationCount.compareTo(a.notificationCount)
-          : b.timeCreated.millisecondsSinceEpoch
+  RoomSorter get sortRoomsBy => (a, b) {
+        if (pinInvitedRooms &&
+            a.membership != b.membership &&
+            [a.membership, b.membership].any((m) => m == Membership.invite)) {
+          return a.membership == Membership.invite ? -1 : 1;
+        } else if (a.isFavourite != b.isFavourite) {
+          return a.isFavourite ? -1 : 1;
+        } else if (pinUnreadRooms &&
+            a.notificationCount != b.notificationCount) {
+          return b.notificationCount.compareTo(a.notificationCount);
+        } else {
+          return b.timeCreated.millisecondsSinceEpoch
               .compareTo(a.timeCreated.millisecondsSinceEpoch);
+        }
+      };
 
   void _sortRooms() {
     if (_sortLock || rooms.length < 2) return;
@@ -2741,12 +2775,15 @@ class Client extends MatrixApi {
   /// Whether all push notifications are muted using the [.m.rule.master]
   /// rule of the push rules: https://matrix.org/docs/spec/client_server/r0.6.0#m-rule-master
   bool get allPushNotificationsMuted {
-    final Map<String, dynamic>? globalPushRules =
-        _accountData[EventTypes.PushRules]?.content['global'];
+    final Map<String, Object?>? globalPushRules =
+        _accountData[EventTypes.PushRules]
+            ?.content
+            .tryGetMap<String, Object?>('global');
     if (globalPushRules == null) return false;
 
-    if (globalPushRules['override'] is List) {
-      for (final pushRule in globalPushRules['override']) {
+    final globalPushRulesOverride = globalPushRules.tryGetList('override');
+    if (globalPushRulesOverride != null) {
+      for (final pushRule in globalPushRulesOverride) {
         if (pushRule['rule_id'] == '.m.rule.master') {
           return pushRule['enabled'];
         }
@@ -2823,12 +2860,12 @@ class Client extends MatrixApi {
   }
 
   /// A list of mxids of users who are ignored.
-  List<String> get ignoredUsers => (_accountData
-              .containsKey('m.ignored_user_list') &&
-          _accountData['m.ignored_user_list']?.content['ignored_users'] is Map)
-      ? List<String>.from(
-          _accountData['m.ignored_user_list']?.content['ignored_users'].keys)
-      : [];
+  List<String> get ignoredUsers =>
+      List<String>.from(_accountData['m.ignored_user_list']
+              ?.content
+              .tryGetMap<String, Object?>('ignored_users')
+              ?.keys ??
+          <String>[]);
 
   /// Ignore another user. This will clear the local cached messages to
   /// hide all previous messages from this user.

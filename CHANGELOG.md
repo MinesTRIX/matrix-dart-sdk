@@ -1,10 +1,57 @@
+## [0.22.3] - 23th August 2023
+- feat: Add option to not cache users in memory when requesting all of a room (krille-chan)
+- fix: Has new messages is never true (Krille)
+
+## [0.22.2] - 6 August 2023
+
+- fix: direct message room name computation (The one with the braid)
+- refactor: simplify UIA stage selection logic (Nicolas Werner)
+- feat: Upload keys on OKB reset (Nicolas Werner)
+- fix: fix upload of old session after reset (Nicolas Werner)
+- refactor: Simplify room sorting logic to make invite sorting more obvious (Nicolas Werner)
+
+## [0.22.1] - 19th July 2023
+
+- chore: add pub release job (td)
+- chore: add dependabot (Niklas Zender)
+- feat: Use github actions (Nicolas Werner)
+- fix: do not proceed call if getUserMedia fails (td)
+
+## [0.22.0] - 4th July 2023
+
+- chore: pass event to redactedAnEvent and removedBy (td)
+
+## [0.21.2] - 27th June 2023
+
+- chore: cleanup some eventTypes and unused variables (td)
+- chore: fix unexpected null when device is not known (td)
+
+## [0.21.1] - 22nd June 2023
+
+- fix: Assign correct type to signedOneTimeKeys (Malin Errenst)
+
+## [0.21.0] - 21st June 2023
+
+- feat: qr key verification (td)
+- refactor: Use tryGet for type casts whenever possible (Malin Errenst)
+- chore: Update matrix_api_lite to 1.7.0 (Malin Errenst)
+- refactor: Added type casts to match refactored matrix_api_lite (Malin Errenst)
+- refactor: Added type casts for refactored dart_openapi_codegen (Malin Errenst)
+- builds: Pin matrix api lite (Krille)
+- fix: Do not display prevContent displayname and avatar for joined users (Krille)
+- builds: Update dart and flutter ci containers (Krille)
+- fix: canRequestHistory should return false if prev_batch is null (Krille)
+
 ## [0.20.5] - 2th June 2023
+
 - chore: fix edited last events breaking db (td)
 
 ## [0.20.4] - 31th May 2023
+
 - fix: Do not store global profiles in room states as members (Krille)
 
 ## [0.20.3] - 30th May 2023
+
 - feat: Display performance warning when requesting more than 100 participants (Krille)
 - fix: Also update last event on redaction in store (Krille)
 - refactor: Let bootstrap throw custom Exception InvalidPassphraseException so it is easier to catch (Krille)

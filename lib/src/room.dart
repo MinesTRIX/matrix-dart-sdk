@@ -249,7 +249,10 @@ class Room {
         (directChatMatrixID == null ? [] : [directChatMatrixID]);
     if (heroes.isNotEmpty) {
       final result = heroes
-          .where((hero) => hero.isNotEmpty)
+          .where(
+            // removing oneself from the hero list
+            (hero) => hero.isNotEmpty && hero != client.userID,
+          )
           .map((hero) => unsafeGetUserFromMemoryOrFallback(hero)
               .calcDisplayname(i18n: i18n))
           .join(', ');
@@ -267,9 +270,10 @@ class Room {
     }
     if (membership == Membership.leave) {
       final invitation = getState(EventTypes.RoomMember, client.userID!);
-      if (invitation != null && invitation.unsigned?['prev_sender'] != null) {
+      if (invitation != null &&
+          invitation.unsigned?.tryGet<String>('prev_sender') != null) {
         final name = unsafeGetUserFromMemoryOrFallback(
-                invitation.unsigned?['prev_sender'])
+                invitation.unsigned!.tryGet<String>('prev_sender')!)
             .calcDisplayname(i18n: i18n);
         return i18n.wasDirectChatDisplayName(name);
       }
@@ -598,9 +602,7 @@ class Room {
   }
 
   /// Returns true if this room has a m.favourite tag.
-  bool get isFavourite =>
-      tags[TagType.favourite] != null ||
-      (client.pinInvitedRooms && membership == Membership.invite);
+  bool get isFavourite => tags[TagType.favourite] != null;
 
   /// Sets the m.favourite tag for this room.
   Future<void> setFavourite(bool favourite) =>
@@ -1098,7 +1100,16 @@ class Room {
           txid: messageID,
         );
       } catch (e, s) {
-        if (e is MatrixException || DateTime.now().isAfter(timeoutDate)) {
+        if (e is MatrixException &&
+            e.retryAfterMs != null &&
+            !DateTime.now()
+                .add(Duration(milliseconds: e.retryAfterMs!))
+                .isAfter(timeoutDate)) {
+          Logs().w(
+              'Ratelimited while sending message, waiting for ${e.retryAfterMs}ms');
+          await Future.delayed(Duration(milliseconds: e.retryAfterMs!));
+        } else if (e is MatrixException ||
+            DateTime.now().isAfter(timeoutDate)) {
           Logs().w('Problem while sending message', e, s);
           syncUpdate.rooms!.join!.values.first.timeline!.events!.first
               .unsigned![messageSendingStatusKey] = EventStatus.error.intValue;
@@ -1106,9 +1117,11 @@ class Room {
           completer.complete();
           _sendingQueue.remove(completer);
           return null;
+        } else {
+          Logs()
+              .w('Problem while sending message: $e Try again in 1 seconds...');
+          await Future.delayed(Duration(seconds: 1));
         }
-        Logs().w('Problem while sending message: $e Try again in 1 seconds...');
-        await Future.delayed(Duration(seconds: 1));
       }
     }
     syncUpdate.rooms!.join!.values.first.timeline!.events!.first
@@ -1279,7 +1292,7 @@ class Room {
     if (client.database != null) {
       await client.database?.transaction(() async {
         if (storeInDatabase) {
-          await client.database?.setRoomPrevBatch(resp.end!, id, client);
+          await client.database?.setRoomPrevBatch(resp.end, id, client);
         }
         await loadFn();
       });
@@ -1315,8 +1328,9 @@ class Room {
   Future<void> removeFromDirectChat() async {
     final directChats = client.directChats.copy();
     for (final k in directChats.keys) {
-      if (directChats[k] is List && directChats[k].contains(id)) {
-        directChats[k].remove(id);
+      final directChat = directChats[k];
+      if (directChat is List && directChat.contains(id)) {
+        directChat.remove(id);
       }
     }
 
@@ -1532,13 +1546,16 @@ class Room {
   /// List `membershipFilter` defines with what membership do you want the
   /// participants, default set to
   /// [[Membership.join, Membership.invite, Membership.knock]]
+  /// Set [cache] to `false` if you do not want to cache the users in memory
+  /// for this session which is highly recommended for large public rooms.
   Future<List<User>> requestParticipants(
       [List<Membership> membershipFilter = const [
         Membership.join,
         Membership.invite,
         Membership.knock,
       ],
-      bool suppressWarning = false]) async {
+      bool suppressWarning = false,
+      bool cache = true]) async {
     if (!participantListComplete && partial) {
       // we aren't fully loaded, maybe the users are in the database
       final users = await client.database?.getUsers(this) ?? [];
@@ -1554,7 +1571,7 @@ class Room {
     }
 
     final memberCount = summary.mJoinedMemberCount;
-    if (!suppressWarning && memberCount != null && memberCount > 100) {
+    if (!suppressWarning && cache && memberCount != null && memberCount > 100) {
       Logs().w('''
         Loading a list of $memberCount participants for the room $id.
         This may affect the performance. Please make sure to not unnecessary
@@ -1567,10 +1584,14 @@ class Room {
             ?.map((e) => Event.fromMatrixEvent(e, this).asUser)
             .toList() ??
         [];
-    for (final user in users) {
-      setState(user); // at *least* cache this in-memory
+
+    if (cache) {
+      for (final user in users) {
+        setState(user); // at *least* cache this in-memory
+      }
     }
-    _requestedParticipants = true;
+
+    _requestedParticipants = cache;
     users.removeWhere((u) => !membershipFilter.contains(u.membership));
     return users;
   }
@@ -1747,7 +1768,7 @@ class Room {
       return getState(EventTypes.RoomCreate)?.senderId == userId ? 100 : 0;
     }
     return powerLevelMap
-            .tryGetMap<String, dynamic>('users')
+            .tryGetMap<String, Object?>('users')
             ?.tryGet<int>(userId) ??
         powerLevelMap.tryGet<int>('users_default') ??
         0;
@@ -1802,7 +1823,7 @@ class Room {
     final powerLevelMap = getState(EventTypes.RoomPowerLevels)?.content;
     if (powerLevelMap == null) return 0;
     return powerLevelMap
-            .tryGetMap<String, dynamic>('events')
+            .tryGetMap<String, Object?>('events')
             ?.tryGet<int>(action) ??
         powerLevelMap.tryGet<int>('state_default') ??
         50;
@@ -1833,7 +1854,8 @@ class Room {
     final currentPowerLevelsMap = getState(EventTypes.RoomPowerLevels)?.content;
     if (currentPowerLevelsMap != null) {
       final newPowerLevelMap = currentPowerLevelsMap;
-      final eventsMap = newPowerLevelMap['events'] ?? {};
+      final eventsMap = newPowerLevelMap.tryGetMap<String, Object?>('events') ??
+          <String, Object?>{};
       eventsMap.addAll({
         EventTypes.GroupCallPrefix: getDefaultPowerLevel(currentPowerLevelsMap),
         EventTypes.GroupCallMemberPrefix:
@@ -1901,7 +1923,7 @@ class Room {
     final powerLevelsMap = getState(EventTypes.RoomPowerLevels)?.content;
     if (powerLevelsMap == null) return 0 <= ownPowerLevel;
     final pl = powerLevelsMap
-            .tryGetMap<String, dynamic>('events')
+            .tryGetMap<String, Object?>('events')
             ?.tryGet<int>(eventType) ??
         powerLevelsMap.tryGet<int>('events_default') ??
         0;
@@ -1913,7 +1935,7 @@ class Room {
     final userLevel = getPowerLevelByUserId(userid);
     final notificationLevel = getState(EventTypes.RoomPowerLevels)
             ?.content
-            .tryGetMap<String, dynamic>('notifications')
+            .tryGetMap<String, Object?>('notifications')
             ?.tryGet<int>(notificationType) ??
         50;
 
