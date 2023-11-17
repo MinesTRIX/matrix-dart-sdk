@@ -1,3 +1,27 @@
+## [0.22.7] - 16 November 2023
+- chore: incrementally add left rooms to archive (The one with the braid)
+- chore: remove archived room on forget (#2) (Clemens-Toegel)
+- chore: store states to archived rooms (#1) (Clemens-Toegel)
+- chore: upgrade lints (Nicolas Werner)
+- chore: use our custom reusable workflow to avoid manually configuring each publish job (td)
+- fix: Code style (The one with the braid)
+- fix: call hangup on timeout race condition (Karthikeyan S)
+- fix: clear local database on logout even if server timesout (td)
+- fix: hangup on call crash (Mohammad Reza Moradi)
+- fix: stale call checker leaks memory (Nicolas Werner)
+
+## [0.22.6] - 23 October 2023
+- fix: Do not convert linebreaks in pre blocks on markdown parsing (Krille)
+- refactor: Wait for room in sync until sync process and trigger cleanup call not before actually start clean up. (Krille)
+
+## [0.22.5] - 20 October 2023
+- build(deps): bump http from 0.13.6 to 1.1.0 (dependabot[bot])
+- feat: Add methods to load all room keys from online key backup (Krille)
+- fix: Convert linebreaks into br tags on markdown parsing (Krille)
+- fix: fixed hardcoded historyCount (Ray)
+- refactor: Trigger upload keys on sync and not in background job and upload them before logout (Krille)
+- refactor: Update markdown (Krille)
+
 ## [0.22.4] - 21 September 2023
 - feat: Implement member change type (Krille)
 - fix: apply state event before decryption on leaved room (Mohammad Reza Moradi)

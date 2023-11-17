@@ -19,6 +19,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:core';
+import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -261,7 +262,7 @@ class Client extends MatrixApi {
 
   bool enableDehydratedDevices = false;
 
-  /// Wether read receipts are sent as public receipts by default or just as private receipts.
+  /// Whether read receipts are sent as public receipts by default or just as private receipts.
   bool receiptsPublicByDefault = true;
 
   /// Whether this client supports end-to-end encryption using olm.
@@ -564,6 +565,8 @@ class Client extends MatrixApi {
   @override
   Future<void> logout() async {
     try {
+      // Upload keys to make sure all are cached on the next login.
+      await encryption?.keyManager.uploadInboundGroupSessions();
       await super.logout();
     } catch (e, s) {
       Logs().e('Logout failed', e, s);
@@ -577,6 +580,9 @@ class Client extends MatrixApi {
   /// including all persistent data from the store.
   @override
   Future<void> logoutAll() async {
+    // Upload keys to make sure all are cached on the next login.
+    await encryption?.keyManager.uploadInboundGroupSessions();
+
     final futures = <Future>[];
     futures.add(super.logoutAll());
     futures.add(clear());
@@ -743,10 +749,17 @@ class Client extends MatrixApi {
       leave = true;
     }
 
-    return await onSync.stream.firstWhere((sync) =>
+    // Wait for the next sync where this room appears.
+    final syncUpdate = await onSync.stream.firstWhere((sync) =>
         invite && (sync.rooms?.invite?.containsKey(roomId) ?? false) ||
         join && (sync.rooms?.join?.containsKey(roomId) ?? false) ||
         leave && (sync.rooms?.leave?.containsKey(roomId) ?? false));
+
+    // Wait for this sync to be completely processed.
+    await onSyncStatus.stream.firstWhere(
+      (syncStatus) => syncStatus.status == SyncStatus.finished,
+    );
+    return syncUpdate;
   }
 
   /// Checks if the given user has encryption keys. May query keys from the
@@ -930,6 +943,7 @@ class Client extends MatrixApi {
     final syncResp = await sync(
       filter: '{"room":{"include_leave":true,"timeline":{"limit":10}}}',
       timeout: _archiveCacheBusterTimeout,
+      setPresence: syncPresence,
     );
     // wrap around and hope there are not more than 30 leaves in 2 minutes :)
     _archiveCacheBusterTimeout = (_archiveCacheBusterTimeout + 1) % 30;
@@ -937,58 +951,74 @@ class Client extends MatrixApi {
     final leave = syncResp.rooms?.leave;
     if (leave != null) {
       for (final entry in leave.entries) {
-        final id = entry.key;
-        final room = entry.value;
-        final leftRoom = Room(
-          id: id,
-          membership: Membership.leave,
-          client: this,
-          roomAccountData:
-              room.accountData?.asMap().map((k, v) => MapEntry(v.type, v)) ??
-                  <String, BasicRoomEvent>{},
-        );
-
-        final timeline = Timeline(
-            room: leftRoom,
-            chunk: TimelineChunk(
-                events: room.timeline?.events?.reversed
-                        .toList() // we display the event in the other sence
-                        .map((e) => Event.fromMatrixEvent(e, leftRoom))
-                        .toList() ??
-                    []));
-
-        leftRoom.prev_batch = room.timeline?.prevBatch;
-        room.state?.forEach((event) {
-          leftRoom.setState(Event.fromMatrixEvent(
-            event,
-            leftRoom,
-          ));
-        });
-
-        room.timeline?.events?.forEach((event) {
-          leftRoom.setState(Event.fromMatrixEvent(
-            event,
-            leftRoom,
-          ));
-        });
-
-        for (var i = 0; i < timeline.events.length; i++) {
-          // Try to decrypt encrypted events but don't update the database.
-          if (leftRoom.encrypted && leftRoom.client.encryptionEnabled) {
-            if (timeline.events[i].type == EventTypes.Encrypted) {
-              timeline.events[i] =
-                  await leftRoom.client.encryption!.decryptRoomEvent(
-                leftRoom.id,
-                timeline.events[i],
-              );
-            }
-          }
-        }
-
-        _archivedRooms.add(ArchivedRoom(room: leftRoom, timeline: timeline));
+        await _storeArchivedRoom(entry.key, entry.value);
       }
     }
     return _archivedRooms;
+  }
+
+  /// [_storeArchivedRoom]
+  /// @leftRoom we can pass a room which was left so that we don't loose states
+  Future<void> _storeArchivedRoom(
+    String id,
+    LeftRoomUpdate update, {
+    Room? leftRoom,
+  }) async {
+    final roomUpdate = update;
+    final archivedRoom = leftRoom ??
+        Room(
+          id: id,
+          membership: Membership.leave,
+          client: this,
+          roomAccountData: roomUpdate.accountData
+                  ?.asMap()
+                  .map((k, v) => MapEntry(v.type, v)) ??
+              <String, BasicRoomEvent>{},
+        );
+    // Set membership of room to leave, in the case we got a left room passed, otherwise
+    // the left room would have still membership join, which would be wrong for the setState later
+    archivedRoom.membership = Membership.leave;
+    final timeline = Timeline(
+        room: archivedRoom,
+        chunk: TimelineChunk(
+            events: roomUpdate.timeline?.events?.reversed
+                    .toList() // we display the event in the other sence
+                    .map((e) => Event.fromMatrixEvent(e, archivedRoom))
+                    .toList() ??
+                []));
+
+    archivedRoom.prev_batch = update.timeline?.prevBatch;
+    update.state?.forEach((event) {
+      archivedRoom.setState(Event.fromMatrixEvent(
+        event,
+        archivedRoom,
+      ));
+    });
+
+    update.timeline?.events?.forEach((event) {
+      archivedRoom.setState(Event.fromMatrixEvent(
+        event,
+        archivedRoom,
+      ));
+    });
+
+    for (var i = 0; i < timeline.events.length; i++) {
+      // Try to decrypt encrypted events but don't update the database.
+      if (archivedRoom.encrypted && archivedRoom.client.encryptionEnabled) {
+        if (timeline.events[i].type == EventTypes.Encrypted) {
+          await archivedRoom.client.encryption!
+              .decryptRoomEvent(
+                archivedRoom.id,
+                timeline.events[i],
+              )
+              .then(
+                (decrypted) => timeline.events[i] = decrypted,
+              );
+        }
+      }
+    }
+
+    _archivedRooms.add(ArchivedRoom(room: archivedRoom, timeline: timeline));
   }
 
   /// Uploads a file and automatically caches it in the database, if it is small enough
@@ -1663,7 +1693,7 @@ class Client extends MatrixApi {
         Logs().d('Running sync while init isn\'t done yet, dropping request');
         return;
       }
-      dynamic syncError;
+      Object? syncError;
       await _checkSyncFilter();
       timeout ??= const Duration(seconds: 30);
       final syncRequest = sync(
@@ -1703,12 +1733,12 @@ class Client extends MatrixApi {
           () async => await _currentTransaction,
           syncResp.itemCount,
         );
-        onSyncStatus.add(SyncStatusUpdate(SyncStatus.cleaningUp));
       } else {
         await _handleSync(syncResp, direction: Direction.f);
       }
       if (_disposed || _aborted) return;
       prevBatch = syncResp.nextBatch;
+      onSyncStatus.add(SyncStatusUpdate(SyncStatus.cleaningUp));
       // ignore: unawaited_futures
       database?.deleteOldFiles(
           DateTime.now().subtract(Duration(days: 30)).millisecondsSinceEpoch);
@@ -1722,6 +1752,8 @@ class Client extends MatrixApi {
         await processToDeviceQueue();
       } catch (_) {} // we want to dispose any errors this throws
 
+      await singleShotStaleCallChecker();
+
       _retryDelay = Future.value();
       onSyncStatus.add(SyncStatusUpdate(SyncStatus.finished));
     } on MatrixException catch (e, s) {
@@ -1731,8 +1763,8 @@ class Client extends MatrixApi {
         Logs().w('The user has been logged out!');
         await clear();
       }
-    } on MatrixConnectionException catch (e, s) {
-      Logs().w('Synchronization connection failed');
+    } on IOException catch (e, s) {
+      Logs().w('Syncloop failed: Client has not connection to the server');
       onSyncStatus.add(SyncStatusUpdate(SyncStatus.error,
           error: SdkError(exception: e, stackTrace: s)));
     } catch (e, s) {
@@ -1771,12 +1803,13 @@ class Client extends MatrixApi {
         await _handleRooms(leave, direction: direction);
       }
     }
-    for (final newPresence in sync.presence ?? []) {
+    for (final newPresence in sync.presence ?? <Presence>[]) {
       final cachedPresence = CachedPresence.fromMatrixEvent(newPresence);
       presences[newPresence.senderId] = cachedPresence;
       // ignore: deprecated_member_use_from_same_package
       onPresence.add(newPresence);
       onPresenceChanged.add(cachedPresence);
+      await database?.storePresence(newPresence.senderId, cachedPresence);
     }
     for (final newAccountData in sync.accountData ?? []) {
       await database?.storeAccountData(
@@ -1889,7 +1922,7 @@ class Client extends MatrixApi {
       final syncRoomUpdate = entry.value;
 
       await database?.storeRoomUpdate(id, syncRoomUpdate, this);
-      final room = _updateRoomsByRoomUpdate(id, syncRoomUpdate);
+      final room = await _updateRoomsByRoomUpdate(id, syncRoomUpdate);
 
       final timelineUpdateType = direction != null
           ? (direction == Direction.b
@@ -2129,7 +2162,11 @@ class Client extends MatrixApi {
     }
   }
 
-  Room _updateRoomsByRoomUpdate(String roomId, SyncRoomUpdate chatUpdate) {
+  /// stores when we last checked for stale calls
+  DateTime lastStaleCallRun = DateTime(0);
+
+  Future<Room> _updateRoomsByRoomUpdate(
+      String roomId, SyncRoomUpdate chatUpdate) async {
     // Update the chat list item.
     // Search the room in the rooms
     final roomIndex = rooms.indexWhere((r) => r.id == roomId);
@@ -2168,12 +2205,14 @@ class Client extends MatrixApi {
     }
     // If the membership is "leave" then remove the item and stop here
     else if (found && membership == Membership.leave) {
-      // stop stale group call checker for left room.
-      room.stopStaleCallsChecker(room.id);
-
       rooms.removeAt(roomIndex);
+
+      // in order to keep the archive in sync, add left room to archive
+      if (chatUpdate is LeftRoomUpdate) {
+        await _storeArchivedRoom(room.id, chatUpdate, leftRoom: room);
+      }
     }
-    // Update notification, highlight count and/or additional informations
+    // Update notification, highlight count and/or additional information
     else if (found &&
         chatUpdate is JoinedRoomUpdate &&
         (rooms[roomIndex].membership != membership ||
@@ -2203,7 +2242,7 @@ class Client extends MatrixApi {
           requestHistoryOnLimitedTimeline) {
         Logs().v(
             'Limited timeline for ${rooms[roomIndex].id} request history now');
-        runInRoot(rooms[roomIndex].requestHistory);
+        unawaited(runInRoot(rooms[roomIndex].requestHistory));
       }
     }
     return room;
@@ -2896,6 +2935,25 @@ class Client extends MatrixApi {
     });
     await clearCache();
     return;
+  }
+
+  /// The newest presence of this user if there is any. Fetches it from the
+  /// database first and then from the server if necessary or returns offline.
+  Future<CachedPresence> fetchCurrentPresence(String userId) async {
+    final cachedPresence = presences[userId];
+    if (cachedPresence != null) {
+      return cachedPresence;
+    }
+
+    final dbPresence = await database?.getPresence(userId);
+    if (dbPresence != null) return presences[userId] = dbPresence;
+
+    try {
+      final newPresence = await getPresence(userId);
+      return CachedPresence.fromPresenceResponse(newPresence, userId);
+    } catch (e) {
+      return CachedPresence.neverSeen(userId);
+    }
   }
 
   bool _disposed = false;

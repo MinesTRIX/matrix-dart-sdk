@@ -320,4 +320,8 @@ abstract class DatabaseApi {
   Future<String> exportDump();
 
   Future<bool> importDump(String export);
+
+  Future<void> storePresence(String userId, CachedPresence presence);
+
+  Future<CachedPresence?> getPresence(String userId);
 }
