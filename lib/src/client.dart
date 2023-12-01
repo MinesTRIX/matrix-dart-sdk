@@ -19,7 +19,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:core';
-import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -305,6 +304,7 @@ class Client extends MatrixApi {
   }
 
   /// Presences of users by a given matrix ID
+  @Deprecated('Use `fetchCurrentPresence(userId)` instead.')
   Map<String, CachedPresence> presences = {};
 
   int _transactionCounter = 0;
@@ -1581,6 +1581,7 @@ class Client extends MatrixApi {
           _accountData = data;
           _updatePushrules();
         });
+        // ignore: deprecated_member_use_from_same_package
         presences.clear();
         if (waitUntilLoadCompletedLoaded) {
           await userDeviceKeysLoading;
@@ -1646,7 +1647,7 @@ class Client extends MatrixApi {
   set backgroundSync(bool enabled) {
     _backgroundSync = enabled;
     if (_backgroundSync) {
-      _sync();
+      runInRoot(() async => _sync());
     }
   }
 
@@ -1693,7 +1694,7 @@ class Client extends MatrixApi {
         Logs().d('Running sync while init isn\'t done yet, dropping request');
         return;
       }
-      Object? syncError;
+      SyncConnectionException? syncError;
       await _checkSyncFilter();
       timeout ??= const Duration(seconds: 30);
       final syncRequest = sync(
@@ -1702,7 +1703,7 @@ class Client extends MatrixApi {
         timeout: timeout.inMilliseconds,
         setPresence: syncPresence,
       ).then((v) => Future<SyncUpdate?>.value(v)).catchError((e) {
-        syncError = e;
+        syncError = SyncConnectionException(e);
         return null;
       });
       _currentSyncId = syncRequest.hashCode;
@@ -1763,7 +1764,7 @@ class Client extends MatrixApi {
         Logs().w('The user has been logged out!');
         await clear();
       }
-    } on IOException catch (e, s) {
+    } on SyncConnectionException catch (e, s) {
       Logs().w('Syncloop failed: Client has not connection to the server');
       onSyncStatus.add(SyncStatusUpdate(SyncStatus.error,
           error: SdkError(exception: e, stackTrace: s)));
@@ -1805,6 +1806,7 @@ class Client extends MatrixApi {
     }
     for (final newPresence in sync.presence ?? <Presence>[]) {
       final cachedPresence = CachedPresence.fromMatrixEvent(newPresence);
+      // ignore: deprecated_member_use_from_same_package
       presences[newPresence.senderId] = cachedPresence;
       // ignore: deprecated_member_use_from_same_package
       onPresence.add(newPresence);
@@ -2242,7 +2244,7 @@ class Client extends MatrixApi {
           requestHistoryOnLimitedTimeline) {
         Logs().v(
             'Limited timeline for ${rooms[roomIndex].id} request history now');
-        unawaited(runInRoot(rooms[roomIndex].requestHistory));
+        runInRoot(rooms[roomIndex].requestHistory);
       }
     }
     return room;
@@ -2940,17 +2942,22 @@ class Client extends MatrixApi {
   /// The newest presence of this user if there is any. Fetches it from the
   /// database first and then from the server if necessary or returns offline.
   Future<CachedPresence> fetchCurrentPresence(String userId) async {
+    // ignore: deprecated_member_use_from_same_package
     final cachedPresence = presences[userId];
     if (cachedPresence != null) {
       return cachedPresence;
     }
 
     final dbPresence = await database?.getPresence(userId);
+    // ignore: deprecated_member_use_from_same_package
     if (dbPresence != null) return presences[userId] = dbPresence;
 
     try {
-      final newPresence = await getPresence(userId);
-      return CachedPresence.fromPresenceResponse(newPresence, userId);
+      final result = await getPresence(userId);
+      final presence = CachedPresence.fromPresenceResponse(result, userId);
+      await database?.storePresence(userId, presence);
+      // ignore: deprecated_member_use_from_same_package
+      return presences[userId] = presence;
     } catch (e) {
       return CachedPresence.neverSeen(userId);
     }
@@ -3130,6 +3137,11 @@ class SdkError {
   StackTrace? stackTrace;
 
   SdkError({this.exception, this.stackTrace});
+}
+
+class SyncConnectionException implements Exception {
+  final Object originalException;
+  SyncConnectionException(this.originalException);
 }
 
 class SyncStatusUpdate {
