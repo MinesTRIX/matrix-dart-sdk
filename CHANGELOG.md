@@ -1,3 +1,59 @@
+## [0.25.4] - 5th January 2023
+- fix: Type error when combining dynamic lists (Krille)
+- refactor: Throw client init exception on client init fail (krille-chan)
+
+## [0.25.3] - 2nd January 2023
+- fix: Delete in transaction on new store does not clear cache correctly (Krille)
+
+## [0.25.2] - 27th December 2023
+- fix: Add missing copy map in matrix sdk database (Krille)
+
+## [0.25.1] - 27th December 2023
+- ci: Test that database can write and read at least 5mb of data (Krille)
+- feat: Make possible to fetch presence from database only (krille-chan)
+- fix: clearCache does not clear room account data (Krille)
+- fix: typerror in removeEvent method from new database (Krille)
+
+## [0.25.0] - 21st December 2023
+- feat: add tests for calls (td)
+- feat: cache getConfig request (Karthikeyan S)
+- fix: canSendDefaultMessage ignores overwritten events (Krille)
+- fix: check negotiate party and call ids (td)
+- fix: ignore calls with age older than lifetime (td)
+- fix: Increase timeout for initial sync from 10 seconds to 2 minutes (Krille)
+- fix: validate account_data values instead of checking them in syncUpdates (td)
+- refactor: Add delete database method (Krille)
+- refactor: Add loadHeroUsers method (Krille)
+- refactor: Connect timeline to event updates earlier (Krille)
+- refactor: Make possible to wait for first sync and await first sync before create megolm session (Krille)
+- ci: Test all databases in unit tests (Krille)
+
+## [0.24.3] - 11th December 2023
+Small hotfix for the new database.
+- refactor: Remove duplicated copyMap method and fix type error (Krille)
+
+## [0.24.2] - 11th December 2023
+- docs: Add issue tracker to pub.dev (Krille)
+- fix: Copy all maps got from database (Krille)
+
+## [0.24.1] - 7th December 2023
+
+This release brings a new **experimental** database based on SQFlite and IndexedDB as a *Drop-In-Replacement* for Hive and HiveCollections. You can already test it out (on your own risk) by using it as the new databaseBuilder and migrate your current users by using the legacyDatabaseBuilder with your current Database:
+
+```dart
+final client = Client('Client Name',
+  databaseBuilder: (client) => MatrixSdkDatabase(
+    'Database Name',
+    database: await databaseFactory.openDatabase(':memory:'),
+  ),
+  legacyDatabaseBuilder: yourPreviousDatabase,
+);
+```
+
+- feat: Implement new Matrix Dart SDK Database (Christian Pauly)
+- fix: Do not hide matrix exceptions in sync (Krille)
+- fix: set cid before initWithInvite to handle getUserMedia exception correctly (Karthikeyan S)
+
 ## [0.24.0] - 29th November 2023
 
 This release deprecates `client.presences` in favor of `client.fetchCurrentPresence(userId)` as part of our journey to a more database centric memory management. However, `client.presences` is still functional and tested at least until the next major release.

@@ -22,6 +22,7 @@ import 'dart:core';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:async/async.dart';
 import 'package:collection/collection.dart' show IterableExtension;
 import 'package:http/http.dart' as http;
 import 'package:mime/mime.dart';
@@ -32,6 +33,7 @@ import 'package:matrix/encryption.dart';
 import 'package:matrix/matrix.dart';
 import 'package:matrix/src/models/timeline_chunk.dart';
 import 'package:matrix/src/utils/cached_stream_controller.dart';
+import 'package:matrix/src/utils/client_init_exception.dart';
 import 'package:matrix/src/utils/compute_callback.dart';
 import 'package:matrix/src/utils/multilock.dart';
 import 'package:matrix/src/utils/run_benchmarked.dart';
@@ -1021,6 +1023,13 @@ class Client extends MatrixApi {
     _archivedRooms.add(ArchivedRoom(room: archivedRoom, timeline: timeline));
   }
 
+  final _serverConfigCache = AsyncCache<ServerConfig>(const Duration(hours: 1));
+
+  /// Gets the config of the content repository, such as upload limit.
+  @override
+  Future<ServerConfig> getConfig() =>
+      _serverConfigCache.fetch(() => super.getConfig());
+
   /// Uploads a file and automatically caches it in the database, if it is small enough
   /// and returns the mxc url.
   @override
@@ -1466,16 +1475,26 @@ class Client extends MatrixApi {
             newUserID == null ||
             newDeviceID == null ||
             newDeviceName == null)) {
-      throw Exception(
-          'If one of [newToken, newUserID, newDeviceID, newDeviceName] is set then all of them must be set!');
+      throw ClientInitPreconditionError(
+        'If one of [newToken, newUserID, newDeviceID, newDeviceName] is set then all of them must be set!',
+      );
     }
 
-    if (_initLock) throw Exception('[init()] has been called multiple times!');
+    if (_initLock) {
+      throw ClientInitPreconditionError(
+        '[init()] has been called multiple times!',
+      );
+    }
     _initLock = true;
+    String? olmAccount;
+    String? accessToken;
+    String? userID;
     try {
       Logs().i('Initialize client $clientName');
       if (isLogged()) {
-        throw Exception('User is already logged in! Call [logout()] first!');
+        throw ClientInitPreconditionError(
+          'User is already logged in! Call [logout()] first!',
+        );
       }
 
       final databaseBuilder = this.databaseBuilder;
@@ -1487,10 +1506,8 @@ class Client extends MatrixApi {
       }
 
       _groupCallSessionId = randomAlpha(12);
+      _serverConfigCache.invalidate();
 
-      String? olmAccount;
-      String? accessToken;
-      String? userID;
       final account = await this.database?.getClient(clientName);
       if (account != null) {
         _id = account['client_id'];
@@ -1596,17 +1613,29 @@ class Client extends MatrixApi {
       );
 
       /// Timeout of 0, so that we don't see a spinner for 30 seconds.
-      final syncFuture = _sync(timeout: Duration.zero);
+      firstSyncReceived = _sync(timeout: Duration.zero);
       if (waitForFirstSync) {
-        await syncFuture;
+        await firstSyncReceived;
       }
       return;
-    } catch (e, s) {
-      Logs().e('Initialization failed', e, s);
-      await logout().catchError((_) => null);
-      onLoginStateChanged.addError(e, s);
-      _initLock = false;
+    } on ClientInitPreconditionError {
       rethrow;
+    } catch (e, s) {
+      Logs().wtf('Client initialization failed', e, s);
+      onLoginStateChanged.addError(e, s);
+      final clientInitException = ClientInitException(
+        e,
+        homeserver: homeserver,
+        accessToken: accessToken,
+        userId: userID,
+        deviceId: deviceID,
+        deviceName: deviceName,
+        olmAccount: olmAccount,
+      );
+      await clear();
+      throw clientInitException;
+    } finally {
+      _initLock = false;
     }
   }
 
@@ -1694,22 +1723,38 @@ class Client extends MatrixApi {
         Logs().d('Running sync while init isn\'t done yet, dropping request');
         return;
       }
-      SyncConnectionException? syncError;
+      Object? syncError;
       await _checkSyncFilter();
+
+      // The timeout we send to the server for the sync loop. It says to the
+      // server that we want to receive an empty sync response after this
+      // amount of time if nothing happens.
       timeout ??= const Duration(seconds: 30);
+
       final syncRequest = sync(
         filter: syncFilterId,
         since: prevBatch,
         timeout: timeout.inMilliseconds,
         setPresence: syncPresence,
       ).then((v) => Future<SyncUpdate?>.value(v)).catchError((e) {
-        syncError = SyncConnectionException(e);
+        if (e is MatrixException) {
+          syncError = e;
+        } else {
+          syncError = SyncConnectionException(e);
+        }
         return null;
       });
       _currentSyncId = syncRequest.hashCode;
       onSyncStatus.add(SyncStatusUpdate(SyncStatus.waitingForResponse));
-      final syncResp =
-          await syncRequest.timeout(timeout + const Duration(seconds: 10));
+
+      // The timeout for the response from the server. If we do not set a sync
+      // timeout (for initial sync) we give the server a longer time to
+      // responde.
+      final responseTimeout = timeout == Duration.zero
+          ? const Duration(minutes: 2)
+          : timeout + const Duration(seconds: 10);
+
+      final syncResp = await syncRequest.timeout(responseTimeout);
       onSyncStatus.add(SyncStatusUpdate(SyncStatus.processing));
       if (syncResp == null) throw syncError ?? 'Unknown sync error';
       if (_currentSyncId != syncRequest.hashCode) {
@@ -2127,6 +2172,22 @@ class Client extends MatrixApi {
               return false;
             });
           }
+
+          final age = callEvent.unsigned?.tryGet<int>('age') ??
+              (DateTime.now().millisecondsSinceEpoch -
+                  callEvent.originServerTs.millisecondsSinceEpoch);
+
+          callEvents.removeWhere((element) {
+            if (callEvent.type == EventTypes.CallInvite &&
+                age >
+                    (callEvent.content.tryGet<int>('lifetime') ??
+                        CallTimeouts.callInviteLifetime.inMilliseconds)) {
+              Logs().v(
+                  'Ommiting invite event ${callEvent.eventId} as age was older than lifetime');
+              return true;
+            }
+            return false;
+          });
         }
       }
     }
@@ -2347,6 +2408,7 @@ class Client extends MatrixApi {
   Future? userDeviceKeysLoading;
   Future? roomsLoading;
   Future? _accountDataLoading;
+  Future? firstSyncReceived;
 
   Future? get accountDataLoading => _accountDataLoading;
 
@@ -2941,7 +3003,10 @@ class Client extends MatrixApi {
 
   /// The newest presence of this user if there is any. Fetches it from the
   /// database first and then from the server if necessary or returns offline.
-  Future<CachedPresence> fetchCurrentPresence(String userId) async {
+  Future<CachedPresence> fetchCurrentPresence(
+    String userId, {
+    bool fetchOnlyFromCached = false,
+  }) async {
     // ignore: deprecated_member_use_from_same_package
     final cachedPresence = presences[userId];
     if (cachedPresence != null) {
@@ -2952,6 +3017,8 @@ class Client extends MatrixApi {
     // ignore: deprecated_member_use_from_same_package
     if (dbPresence != null) return presences[userId] = dbPresence;
 
+    if (fetchOnlyFromCached) return CachedPresence.neverSeen(userId);
+
     try {
       final result = await getPresence(userId);
       final presence = CachedPresence.fromPresenceResponse(result, userId);
@@ -2959,7 +3026,10 @@ class Client extends MatrixApi {
       // ignore: deprecated_member_use_from_same_package
       return presences[userId] = presence;
     } catch (e) {
-      return CachedPresence.neverSeen(userId);
+      final presence = CachedPresence.neverSeen(userId);
+      await database?.storePresence(userId, presence);
+      // ignore: deprecated_member_use_from_same_package
+      return presences[userId] = presence;
     }
   }
 
@@ -3012,123 +3082,123 @@ class Client extends MatrixApi {
     final migrateClient = await legacyDatabase?.getClient(clientName);
     final database = this.database;
 
-    if (migrateClient != null && legacyDatabase != null && database != null) {
-      Logs().i('Found data in the legacy database!');
-      onMigration?.call();
-      _id = migrateClient['client_id'];
-      await database.insertClient(
-        clientName,
-        migrateClient['homeserver_url'],
-        migrateClient['token'],
-        migrateClient['user_id'],
-        migrateClient['device_id'],
-        migrateClient['device_name'],
-        null,
-        migrateClient['olm_account'],
-      );
-      Logs().d('Migrate SSSSCache...');
-      for (final type in cacheTypes) {
-        final ssssCache = await legacyDatabase.getSSSSCache(type);
-        if (ssssCache != null) {
-          Logs().d('Migrate $type...');
-          await database.storeSSSSCache(
-            type,
-            ssssCache.keyId ?? '',
-            ssssCache.ciphertext ?? '',
-            ssssCache.content ?? '',
+    if (migrateClient == null || legacyDatabase == null || database == null) {
+      await legacyDatabase?.close();
+      _initLock = false;
+      return;
+    }
+    Logs().i('Found data in the legacy database!');
+    onMigration?.call();
+    _id = migrateClient['client_id'];
+    await database.insertClient(
+      clientName,
+      migrateClient['homeserver_url'],
+      migrateClient['token'],
+      migrateClient['user_id'],
+      migrateClient['device_id'],
+      migrateClient['device_name'],
+      null,
+      migrateClient['olm_account'],
+    );
+    Logs().d('Migrate SSSSCache...');
+    for (final type in cacheTypes) {
+      final ssssCache = await legacyDatabase.getSSSSCache(type);
+      if (ssssCache != null) {
+        Logs().d('Migrate $type...');
+        await database.storeSSSSCache(
+          type,
+          ssssCache.keyId ?? '',
+          ssssCache.ciphertext ?? '',
+          ssssCache.content ?? '',
+        );
+      }
+    }
+    Logs().d('Migrate OLM sessions...');
+    try {
+      final olmSessions = await legacyDatabase.getAllOlmSessions();
+      for (final identityKey in olmSessions.keys) {
+        final sessions = olmSessions[identityKey]!;
+        for (final sessionId in sessions.keys) {
+          final session = sessions[sessionId]!;
+          await database.storeOlmSession(
+            identityKey,
+            session['session_id'] as String,
+            session['pickle'] as String,
+            session['last_received'] as int,
           );
         }
       }
-      Logs().d('Migrate OLM sessions...');
-      try {
-        final olmSessions = await legacyDatabase.getAllOlmSessions();
-        for (final identityKey in olmSessions.keys) {
-          final sessions = olmSessions[identityKey]!;
-          for (final sessionId in sessions.keys) {
-            final session = sessions[sessionId]!;
-            await database.storeOlmSession(
-              identityKey,
-              session['session_id'] as String,
-              session['pickle'] as String,
-              session['last_received'] as int,
-            );
-          }
+    } catch (e, s) {
+      Logs().e('Unable to migrate OLM sessions!', e, s);
+    }
+    Logs().d('Migrate Device Keys...');
+    final userDeviceKeys = await legacyDatabase.getUserDeviceKeys(this);
+    for (final userId in userDeviceKeys.keys) {
+      Logs().d('Migrate Device Keys of user $userId...');
+      final deviceKeysList = userDeviceKeys[userId];
+      for (final crossSigningKey
+          in deviceKeysList?.crossSigningKeys.values ?? <CrossSigningKey>[]) {
+        final pubKey = crossSigningKey.publicKey;
+        if (pubKey != null) {
+          Logs().d(
+              'Migrate cross signing key with usage ${crossSigningKey.usage} and verified ${crossSigningKey.directVerified}...');
+          await database.storeUserCrossSigningKey(
+            userId,
+            pubKey,
+            jsonEncode(crossSigningKey.toJson()),
+            crossSigningKey.directVerified,
+            crossSigningKey.blocked,
+          );
         }
-      } catch (e, s) {
-        Logs().e('Unable to migrate OLM sessions!', e, s);
       }
-      Logs().d('Migrate Device Keys...');
-      final userDeviceKeys = await legacyDatabase.getUserDeviceKeys(this);
-      for (final userId in userDeviceKeys.keys) {
-        Logs().d('Migrate Device Keys of user $userId...');
-        final deviceKeysList = userDeviceKeys[userId];
-        for (final crossSigningKey
-            in deviceKeysList?.crossSigningKeys.values ?? <CrossSigningKey>[]) {
-          final pubKey = crossSigningKey.publicKey;
-          if (pubKey != null) {
-            Logs().d(
-                'Migrate cross signing key with usage ${crossSigningKey.usage} and verified ${crossSigningKey.directVerified}...');
-            await database.storeUserCrossSigningKey(
+
+      if (deviceKeysList != null) {
+        for (final deviceKeys in deviceKeysList.deviceKeys.values) {
+          final deviceId = deviceKeys.deviceId;
+          if (deviceId != null) {
+            Logs().d('Migrate device keys for ${deviceKeys.deviceId}...');
+            await database.storeUserDeviceKey(
               userId,
-              pubKey,
-              jsonEncode(crossSigningKey.toJson()),
-              crossSigningKey.directVerified,
-              crossSigningKey.blocked,
+              deviceId,
+              jsonEncode(deviceKeys.toJson()),
+              deviceKeys.directVerified,
+              deviceKeys.blocked,
+              deviceKeys.lastActive.millisecondsSinceEpoch,
             );
           }
         }
-
-        if (deviceKeysList != null) {
-          for (final deviceKeys in deviceKeysList.deviceKeys.values) {
-            final deviceId = deviceKeys.deviceId;
-            if (deviceId != null) {
-              Logs().d('Migrate device keys for ${deviceKeys.deviceId}...');
-              await database.storeUserDeviceKey(
-                userId,
-                deviceId,
-                jsonEncode(deviceKeys.toJson()),
-                deviceKeys.directVerified,
-                deviceKeys.blocked,
-                deviceKeys.lastActive.millisecondsSinceEpoch,
-              );
-            }
-          }
-          Logs().d('Migrate user device keys info...');
-          await database.storeUserDeviceKeysInfo(
-              userId, deviceKeysList.outdated);
-        }
+        Logs().d('Migrate user device keys info...');
+        await database.storeUserDeviceKeysInfo(userId, deviceKeysList.outdated);
       }
-      Logs().d('Migrate inbound group sessions...');
-      try {
-        final sessions = await legacyDatabase.getAllInboundGroupSessions();
-        for (var i = 0; i < sessions.length; i++) {
-          Logs().d('$i / ${sessions.length}');
-          final session = sessions[i];
-          await database.storeInboundGroupSession(
-            session.roomId,
-            session.sessionId,
-            session.pickle,
-            session.content,
-            session.indexes,
-            session.allowedAtIndex,
-            session.senderKey,
-            session.senderClaimedKeys,
-          );
-        }
-      } catch (e, s) {
-        Logs().e('Unable to migrate inbound group sessions!', e, s);
-      }
-
-      await legacyDatabase.clear();
     }
-    await legacyDatabase?.close();
+    Logs().d('Migrate inbound group sessions...');
+    try {
+      final sessions = await legacyDatabase.getAllInboundGroupSessions();
+      for (var i = 0; i < sessions.length; i++) {
+        Logs().d('$i / ${sessions.length}');
+        final session = sessions[i];
+        await database.storeInboundGroupSession(
+          session.roomId,
+          session.sessionId,
+          session.pickle,
+          session.content,
+          session.indexes,
+          session.allowedAtIndex,
+          session.senderKey,
+          session.senderClaimedKeys,
+        );
+      }
+    } catch (e, s) {
+      Logs().e('Unable to migrate inbound group sessions!', e, s);
+    }
+
+    await legacyDatabase.delete();
+
     _initLock = false;
-    if (migrateClient != null) {
-      return init(
-        waitForFirstSync: false,
-        waitUntilLoadCompletedLoaded: false,
-      );
-    }
+    return init(
+      waitForFirstSync: false,
+      waitUntilLoadCompletedLoaded: false,
+    );
   }
 }
 
