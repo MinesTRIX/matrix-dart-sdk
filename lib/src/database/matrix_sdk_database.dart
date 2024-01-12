@@ -1077,9 +1077,9 @@ class MatrixSdkDatabase extends DatabaseApi {
       if (status.isSynced) {
         final type = eventUpdate.content['type'];
         final msgType = eventUpdate.content['msgtype'];
-        final data = await _eventsTypesBox
+        final eventsTypesList = List<String>.from(await _eventsTypesBox
                 .get(getIdFromTypeAndMsgType(type ?? '', msgType: msgType)) ??
-            [];
+            []);
 
         int itemPos = 0;
         final objectId = TupleKey(eventUpdate.roomID, eventId,
@@ -1087,16 +1087,16 @@ class MatrixSdkDatabase extends DatabaseApi {
             .toString();
 
         // remove previous item
-        final int pos = data.indexOf(objectId);
+        final int pos = eventsTypesList.indexOf(objectId);
         if (pos != -1) {
-          data.removeAt(pos);
+          eventsTypesList.removeAt(pos);
         }
 
         final itemDateTime = int.parse(TupleKey.fromString(objectId).parts[2]);
 
         // calc position of new item
-        for (itemPos = 0; itemPos < data.length; itemPos++) {
-          final item = TupleKey.fromString(data[itemPos]);
+        for (itemPos = 0; itemPos < eventsTypesList.length; itemPos++) {
+          final item = TupleKey.fromString(eventsTypesList[itemPos]);
           final dateTime = int.parse(item.parts[2]);
 
           if (dateTime > itemDateTime) {
@@ -1104,7 +1104,7 @@ class MatrixSdkDatabase extends DatabaseApi {
           }
         }
 
-        data.insert(itemPos, objectId);
+        eventsTypesList.insert(itemPos, objectId);
 
         // there is a bug corrupting the ordering of events...
         /* data.sort((a, b) {
@@ -1115,7 +1115,7 @@ class MatrixSdkDatabase extends DatabaseApi {
         });
 */
         await _eventsTypesBox.put(
-            getIdFromTypeAndMsgType(type, msgType: msgType), data);
+            getIdFromTypeAndMsgType(type, msgType: msgType), eventsTypesList);
       }
 
       // Is there a transaction id? Then delete the event with this id.
