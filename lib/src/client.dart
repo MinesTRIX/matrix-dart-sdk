@@ -89,6 +89,10 @@ class Client extends MatrixApi {
 
   bool shareKeysWithUnverifiedDevices;
 
+  Future<void> Function(Client client)? onSoftLogout;
+
+  DateTime? accessTokenExpiresAt;
+
   // For CommandsClientExtension
   final Map<String, FutureOr<String?> Function(CommandArgs)> commands = {};
   final Filter syncFilter;
@@ -161,6 +165,12 @@ class Client extends MatrixApi {
     Set<KeyVerificationMethod>? verificationMethods,
     http.Client? httpClient,
     Set<String>? importantStateEvents,
+
+    /// You probably don't want to add state events which are also
+    /// in important state events to this list, or get ready to face
+    /// only having one event of that particular type in preLoad because
+    /// previewEvents are stored with stateKey '' not the actual state key
+    /// of your state event
     Set<String>? roomPreviewLastEvents,
     this.pinUnreadRooms = false,
     this.pinInvitedRooms = true,
@@ -178,6 +188,13 @@ class Client extends MatrixApi {
     this.shareKeysWithUnverifiedDevices = true,
     this.enableDehydratedDevices = false,
     this.receiptsPublicByDefault = true,
+
+    /// Implement your https://spec.matrix.org/v1.9/client-server-api/#soft-logout
+    /// logic here.
+    /// Set this to `refreshAccessToken()` for the easiest way to handle the
+    /// most common reason for soft logouts.
+    /// You can also perform a new login here by passing the existing deviceId.
+    this.onSoftLogout,
   })  : syncFilter = syncFilter ??
             Filter(
               room: RoomFilter(
@@ -216,12 +233,51 @@ class Client extends MatrixApi {
       EventTypes.CallAnswer,
       EventTypes.CallReject,
       EventTypes.CallHangup,
-      EventTypes.GroupCallPrefix,
-      EventTypes.GroupCallMemberPrefix,
+
+      /// hack because having them both in important events and roomPreivew
+      /// makes the statekey '' which means you can only have one event of that
+      /// type
+      // EventTypes.GroupCallPrefix,
+      // EventTypes.GroupCallMemberPrefix,
     ]);
 
     // register all the default commands
     registerDefaultCommands();
+  }
+
+  /// Fetches the refreshToken from the database and tries to get a new
+  /// access token from the server and then stores it correctly. Unlike the
+  /// pure API call of `Client.refresh()` this handles the complete soft
+  /// logout case.
+  /// Throws an Exception if there is no refresh token available or the
+  /// client is not logged in.
+  Future<void> refreshAccessToken() async {
+    final storedClient = await database?.getClient(clientName);
+    final refreshToken = storedClient?.tryGet<String>('refresh_token');
+    if (refreshToken == null) {
+      throw Exception('No refresh token available');
+    }
+    final homeserverUrl = homeserver?.toString();
+    final userId = userID;
+    final deviceId = deviceID;
+    if (homeserverUrl == null || userId == null || deviceId == null) {
+      throw Exception('Cannot refresh access token when not logged in');
+    }
+
+    final tokenResponse = await refresh(refreshToken);
+
+    accessToken = tokenResponse.accessToken;
+    await database?.updateClient(
+      homeserverUrl,
+      tokenResponse.accessToken,
+      accessTokenExpiresAt,
+      tokenResponse.refreshToken,
+      userId,
+      deviceId,
+      deviceName,
+      prevBatch,
+      encryption?.pickledOlmAccount,
+    );
   }
 
   /// The required name for this client.
@@ -485,6 +541,7 @@ class Client extends MatrixApi {
       deviceId: deviceId,
       initialDeviceDisplayName: initialDeviceDisplayName,
       inhibitLogin: inhibitLogin,
+      refreshToken: refreshToken ?? onSoftLogout != null,
     );
 
     // Connect if there is an access token in the response.
@@ -496,8 +553,15 @@ class Client extends MatrixApi {
       throw Exception(
           'Registered but token, device ID, user ID or homeserver is null.');
     }
+    final expiresInMs = response.expiresInMs;
+    final tokenExpiresAt = expiresInMs == null
+        ? null
+        : DateTime.now().add(Duration(milliseconds: expiresInMs));
+
     await init(
         newToken: accessToken,
+        newTokenExpiresAt: tokenExpiresAt,
+        newRefreshToken: response.refreshToken,
         newUserID: userId,
         newHomeserver: homeserver,
         newDeviceName: initialDeviceDisplayName ?? '',
@@ -548,6 +612,7 @@ class Client extends MatrixApi {
       medium: medium,
       // ignore: deprecated_member_use
       address: address,
+      refreshToken: refreshToken ?? onSoftLogout != null,
     );
 
     // Connect if there is an access token in the response.
@@ -558,8 +623,16 @@ class Client extends MatrixApi {
     if (homeserver_ == null) {
       throw Exception('Registered but homerserver is null.');
     }
+
+    final expiresInMs = response.expiresInMs;
+    final tokenExpiresAt = expiresInMs == null
+        ? null
+        : DateTime.now().add(Duration(milliseconds: expiresInMs));
+
     await init(
       newToken: accessToken,
+      newTokenExpiresAt: tokenExpiresAt,
+      newRefreshToken: response.refreshToken,
       newUserID: userId,
       newHomeserver: homeserver_,
       newDeviceName: initialDeviceDisplayName ?? '',
@@ -705,6 +778,7 @@ class Client extends MatrixApi {
     CreateRoomPreset preset = CreateRoomPreset.privateChat,
     List<StateEvent>? initialState,
     Visibility? visibility,
+    HistoryVisibility? historyVisibility,
     bool waitForSync = true,
     bool groupCall = false,
     Map<String, dynamic>? powerLevelContentOverride,
@@ -719,6 +793,17 @@ class Client extends MatrixApi {
             'algorithm': supportedGroupEncryptionAlgorithms.first,
           },
           type: EventTypes.Encryption,
+        ));
+      }
+    }
+    if (historyVisibility != null) {
+      initialState ??= [];
+      if (!initialState.any((s) => s.type == EventTypes.HistoryVisibility)) {
+        initialState.add(StateEvent(
+          content: {
+            'history_visibility': historyVisibility.text,
+          },
+          type: EventTypes.HistoryVisibility,
         ));
       }
     }
@@ -1462,6 +1547,8 @@ class Client extends MatrixApi {
   /// `userDeviceKeysLoading` where it is necessary.
   Future<void> init({
     String? newToken,
+    DateTime? newTokenExpiresAt,
+    String? newRefreshToken,
     Uri? newHomeserver,
     String? newUserID,
     String? newDeviceName,
@@ -1519,6 +1606,11 @@ class Client extends MatrixApi {
         _id = account['client_id'];
         homeserver = Uri.parse(account['homeserver_url']);
         accessToken = this.accessToken = account['token'];
+        final tokenExpiresAtMs =
+            int.tryParse(account.tryGet<String>('token_expires_at') ?? '');
+        accessTokenExpiresAt = tokenExpiresAtMs == null
+            ? null
+            : DateTime.fromMillisecondsSinceEpoch(tokenExpiresAtMs);
         userID = _userID = account['user_id'];
         _deviceID = account['device_id'];
         _deviceName = account['device_name'];
@@ -1528,6 +1620,7 @@ class Client extends MatrixApi {
       }
       if (newToken != null) {
         accessToken = this.accessToken = newToken;
+        accessTokenExpiresAt = newTokenExpiresAt;
         homeserver = newHomeserver;
         userID = _userID = newUserID;
         _deviceID = newDeviceID;
@@ -1535,6 +1628,7 @@ class Client extends MatrixApi {
         olmAccount = newOlmAccount;
       } else {
         accessToken = this.accessToken = newToken ?? accessToken;
+        accessTokenExpiresAt = newTokenExpiresAt ?? accessTokenExpiresAt;
         homeserver = newHomeserver ?? homeserver;
         userID = _userID = newUserID ?? userID;
         _deviceID = newDeviceID ?? _deviceID;
@@ -1575,6 +1669,8 @@ class Client extends MatrixApi {
           await database.updateClient(
             homeserver.toString(),
             accessToken,
+            accessTokenExpiresAt,
+            newRefreshToken,
             userID,
             _deviceID,
             _deviceName,
@@ -1586,6 +1682,8 @@ class Client extends MatrixApi {
             clientName,
             homeserver.toString(),
             accessToken,
+            accessTokenExpiresAt,
+            newRefreshToken,
             userID,
             _deviceID,
             _deviceName,
@@ -1732,6 +1830,15 @@ class Client extends MatrixApi {
       Object? syncError;
       await _checkSyncFilter();
 
+      // Call onSoftLogout 5 minutes before access token expires to prevent
+      // failing network requests.
+      final tokenExpiresAt = accessTokenExpiresAt;
+      if (onSoftLogout != null &&
+          tokenExpiresAt != null &&
+          tokenExpiresAt.difference(DateTime.now()) <= Duration(minutes: 5)) {
+        await onSoftLogout?.call(this);
+      }
+
       // The timeout we send to the server for the sync loop. It says to the
       // server that we want to receive an empty sync response after this
       // amount of time if nothing happens.
@@ -1804,16 +1911,25 @@ class Client extends MatrixApi {
         await processToDeviceQueue();
       } catch (_) {} // we want to dispose any errors this throws
 
-      await singleShotStaleCallChecker();
-
       _retryDelay = Future.value();
       onSyncStatus.add(SyncStatusUpdate(SyncStatus.finished));
     } on MatrixException catch (e, s) {
       onSyncStatus.add(SyncStatusUpdate(SyncStatus.error,
           error: SdkError(exception: e, stackTrace: s)));
       if (e.error == MatrixError.M_UNKNOWN_TOKEN) {
-        Logs().w('The user has been logged out!');
-        await clear();
+        final onSoftLogout = this.onSoftLogout;
+        if (e.raw.tryGet<bool>('soft_logout') == true && onSoftLogout != null) {
+          Logs().w('The user has been soft logged out! Try to login again...');
+          try {
+            await onSoftLogout(this);
+          } catch (e, s) {
+            Logs().e('Unable to login again', e, s);
+            await clear();
+          }
+        } else {
+          Logs().w('The user has been logged out!');
+          await clear();
+        }
       }
     } on SyncConnectionException catch (e, s) {
       Logs().w('Syncloop failed: Client has not connection to the server');
@@ -3098,10 +3214,16 @@ class Client extends MatrixApi {
     Logs().i('Found data in the legacy database!');
     onMigration?.call();
     _id = migrateClient['client_id'];
+    final tokenExpiresAtMs =
+        int.tryParse(migrateClient.tryGet<String>('token_expires_at') ?? '');
     await database.insertClient(
       clientName,
       migrateClient['homeserver_url'],
       migrateClient['token'],
+      tokenExpiresAtMs == null
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch(tokenExpiresAtMs),
+      migrateClient['refresh_token'],
       migrateClient['user_id'],
       migrateClient['device_id'],
       migrateClient['device_name'],

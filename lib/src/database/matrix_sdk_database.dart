@@ -738,6 +738,8 @@ class MatrixSdkDatabase extends DatabaseApi {
       String name,
       String homeserverUrl,
       String token,
+      DateTime? tokenExpiresAt,
+      String? refreshToken,
       String userId,
       String? deviceId,
       String? deviceName,
@@ -746,6 +748,17 @@ class MatrixSdkDatabase extends DatabaseApi {
     await transaction(() async {
       await _clientBox.put('homeserver_url', homeserverUrl);
       await _clientBox.put('token', token);
+      if (tokenExpiresAt == null) {
+        await _clientBox.delete('token_expires_at');
+      } else {
+        await _clientBox.put('token_expires_at',
+            tokenExpiresAt.millisecondsSinceEpoch.toString());
+      }
+      if (refreshToken == null) {
+        await _clientBox.delete('refresh_token');
+      } else {
+        await _clientBox.put('refresh_token', refreshToken);
+      }
       await _clientBox.put('user_id', userId);
       if (deviceId == null) {
         await _clientBox.delete('device_id');
@@ -1397,6 +1410,8 @@ class MatrixSdkDatabase extends DatabaseApi {
   Future<void> updateClient(
     String homeserverUrl,
     String token,
+    DateTime? tokenExpiresAt,
+    String? refreshToken,
     String userId,
     String? deviceId,
     String? deviceName,
@@ -1406,6 +1421,17 @@ class MatrixSdkDatabase extends DatabaseApi {
     await transaction(() async {
       await _clientBox.put('homeserver_url', homeserverUrl);
       await _clientBox.put('token', token);
+      if (tokenExpiresAt == null) {
+        await _clientBox.delete('token_expires_at');
+      } else {
+        await _clientBox.put('token_expires_at',
+            tokenExpiresAt.millisecondsSinceEpoch.toString());
+      }
+      if (refreshToken == null) {
+        await _clientBox.delete('refresh_token');
+      } else {
+        await _clientBox.put('refresh_token', refreshToken);
+      }
       await _clientBox.put('user_id', userId);
       if (deviceId == null) {
         await _clientBox.delete('device_id');
