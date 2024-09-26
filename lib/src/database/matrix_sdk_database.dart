@@ -22,6 +22,7 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:collection/collection.dart';
 import 'package:sqflite_common/sqflite.dart';
 
 import 'package:matrix/encryption/utils/olm_session.dart';
@@ -82,6 +83,9 @@ class MatrixSdkDatabase extends DatabaseApi {
   /// Key is a tuple as TupleKey(roomId, eventId)
   late Box<Map> _eventsBox;
 
+  /// Key is a string of the event type
+  late Box<List> _eventsTypesBox;
+
   /// Key is a tuple as TupleKey(userId, deviceId)
   late Box<String> _seenDeviceIdsBox;
 
@@ -133,6 +137,8 @@ class MatrixSdkDatabase extends DatabaseApi {
 
   static const String _eventsBoxName = 'box_events';
 
+  static const String _eventsTypesBoxName = 'box_events_types';
+
   static const String _seenDeviceIdsBoxName = 'box_seen_device_ids';
 
   static const String _seenDeviceKeysBoxName = 'box_seen_device_keys';
@@ -180,6 +186,7 @@ class MatrixSdkDatabase extends DatabaseApi {
         _presencesBoxName,
         _timelineFragmentsBoxName,
         _eventsBoxName,
+        _eventsTypesBoxName,
         _seenDeviceIdsBoxName,
         _seenDeviceKeysBoxName,
       },
@@ -241,6 +248,9 @@ class MatrixSdkDatabase extends DatabaseApi {
     _eventsBox = _collection.openBox(
       _eventsBoxName,
     );
+    _eventsTypesBox = _collection.openBox(
+      _eventsTypesBoxName,
+    );
     _seenDeviceIdsBox = _collection.openBox(
       _seenDeviceIdsBoxName,
     );
@@ -277,6 +287,7 @@ class MatrixSdkDatabase extends DatabaseApi {
         await _nonPreloadRoomStateBox.clear();
         await _roomMembersBox.clear();
         await _eventsBox.clear();
+        await _eventsTypesBox.clear();
         await _timelineFragmentsBox.clear();
         await _outboundGroupSessionsBox.clear();
         await _presencesBox.clear();
@@ -1077,6 +1088,49 @@ class MatrixSdkDatabase extends DatabaseApi {
           await _timelineFragmentsBox.put(key, eventIds..removeAt(i));
         }
       }
+      if (status.isSynced) {
+        final type = eventUpdate.content['type'];
+        final msgType = eventUpdate.content['msgtype'];
+        final eventsTypesList = List<String>.from(await _eventsTypesBox
+                .get(getIdFromTypeAndMsgType(type ?? '', msgType: msgType)) ??
+            []);
+
+        int itemPos = 0;
+        final objectId = TupleKey(eventUpdate.roomID, eventId,
+                eventUpdate.content.tryGet('origin_server_ts').toString())
+            .toString();
+
+        // remove previous item
+        final int pos = eventsTypesList.indexOf(objectId);
+        if (pos != -1) {
+          eventsTypesList.removeAt(pos);
+        }
+
+        final itemDateTime = int.parse(TupleKey.fromString(objectId).parts[2]);
+
+        // calc position of new item
+        for (itemPos = 0; itemPos < eventsTypesList.length; itemPos++) {
+          final item = TupleKey.fromString(eventsTypesList[itemPos]);
+          final dateTime = int.parse(item.parts[2]);
+
+          if (dateTime > itemDateTime) {
+            break;
+          }
+        }
+
+        eventsTypesList.insert(itemPos, objectId);
+
+        // there is a bug corrupting the ordering of events...
+        /* data.sort((a, b) {
+          final aInt = int.parse(TupleKey.fromString(a).parts[2]);
+          final bInt = int.parse(TupleKey.fromString(b).parts[2]);
+
+          return aInt.compareTo(bInt);
+        });
+*/
+        await _eventsTypesBox.put(
+            getIdFromTypeAndMsgType(type, msgType: msgType), eventsTypesList);
+      }
 
       // Is there a transaction id? Then delete the event with this id.
       if (!status.isError && !status.isSending && transactionId != null) {
@@ -1587,6 +1641,40 @@ class MatrixSdkDatabase extends DatabaseApi {
       return false;
     }
   }
+
+  String getIdFromTypeAndMsgType(String type, {String? msgType}) {
+    return msgType != null ? '$type/$msgType' : type;
+  }
+
+  @override
+  Future<List<Event>> getEventListForType(String type, List<Room> rooms,
+          {int start = 0, int limit = 10, String? msgType}) =>
+      runBenchmarked<List<Event>>('Get event types', () async {
+        final keys = (await _eventsTypesBox
+                    .get(getIdFromTypeAndMsgType(type, msgType: msgType)) ??
+                [])
+            .cast<String>()
+            .map((e) =>
+                TupleKey.byParts(TupleKey.fromString(e).parts.take(2).toList())
+                    .toString())
+            .toList();
+
+        final rawEvents = (await _eventsBox.getAll(keys));
+
+        final events = <Event>[];
+
+        final maxLen = min(rawEvents.length, limit + start);
+        if (maxLen - start <= 0) return [];
+        for (var i = start; i < maxLen; i++) {
+          final j = rawEvents.length - i - 1;
+          final tuple = TupleKey.fromString(keys[j]);
+          final room = rooms.firstWhereOrNull((r) => r.id == tuple.parts.first);
+          if (room != null) {
+            events.add(Event.fromJson(copyMap(rawEvents[j]!), room));
+          }
+        }
+        return events;
+      });
 
   @override
   Future<List<String>> getEventIdList(

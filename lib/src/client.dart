@@ -476,6 +476,16 @@ class Client extends MatrixApi {
       if (checkWellKnown) {
         try {
           wellKnown = await getWellknown();
+          // When given a url of the form dendrite.matrix.org:443,
+          // The conversion will fail by setting
+          // Scheme: dendrite.matrix.org
+          // Path: 443
+          // TODO: Don't hard code like this
+          if (wellKnown.mHomeserver.baseUrl.path.endsWith('443')) {
+            wellKnown.mHomeserver.baseUrl =
+                Uri.https(wellKnown.mHomeserver.baseUrl.toString());
+          }
+
           homeserver = wellKnown.mHomeserver.baseUrl.stripTrailingSlash();
         } catch (e) {
           Logs().v('Found no well known information', e);

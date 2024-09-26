@@ -472,6 +472,12 @@ class FamedlySdkHiveDatabase extends DatabaseApi with ZoneTransactionMixin {
   }
 
   @override
+  Future<List<Event>> getEventListForType(String type, List<Room> rooms,
+      {int start = 0, int? limit, String? msgType}) async {
+    return [];
+  }
+
+  @override
   Future<List<StoredInboundGroupSession>>
       getInboundGroupSessionsToUpload() async {
     final sessions = (await Future.wait(_inboundGroupSessionsBox.keys.map(
